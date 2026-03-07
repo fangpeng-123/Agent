@@ -1,0 +1,124 @@
+# 服务模式配置
+service:
+  mode: auto  # auto:自动检测, local:本地模型, api:API服务
+  local_model_path: ./models
+
+# Embedding配置
+embedding:
+  local:
+    model_name: BAAI/bge-small-zh
+    device: cuda  # cuda或cpu
+  api:
+    provider: ali  # ali:阿里云, openai:OpenAI
+    model: text-embedding-v2
+    dimensions: 1536
+
+# LLM配置
+llm:
+  local:
+    model_name: Qwen/Qwen2.5-7B-Instruct
+    device: cuda
+  api:
+    provider: ali  # ali:阿里云, openai:OpenAI
+    model: qwen-turbo
+    max_tokens: 2000
+    temperature: 0.7
+
+# RAG配置
+rag:
+  top_k: 5
+  max_history: 5
+  chunk_size: 500
+  chunk_overlap: 100
+
+# 服务器配置
+server:
+  host: 0.0.0.0
+  port: 8000
+
+# 向量库配置
+vector_store:
+  type: chroma  # chroma
+  chroma:
+    persist_directory: data/index/chroma
+    collection_name: health_knowledge
+
+# 对话历史配置
+history:
+  db_path: data/sqlite/history.db
+  max_sessions: 100
+
+# 内容安全配置
+safety:
+  enabled: true
+  sensitive_words:
+    - 分裂
+    - 叛乱
+    - 恐怖
+
+# 企业微信配置
+wechat_work:
+  corp_id: ""
+  agent_id: ""
+  secret: ""
+  token: ""
+  encoding_aes_key: ""
+  callback_url: ""
+  api_base_url: "https://qyapi.weixin.qq.com"
+  safe_mode: 1
+  enable_id_trans: 0
+
+# 客服审核配置
+review:
+  enabled: true
+  customer_service_user_id: ""
+  levels:
+    L0:
+      description: "基础健康知识、定义解释"
+      auto_reply: true
+    L1:
+      description: "饮食建议、运动方案"
+      auto_reply: false
+      sampling_review: true
+    L2:
+      description: "科室推荐、医院选择"
+      auto_reply: false
+      require_review: true
+    L3:
+      description: "诊断建议、用药指导"
+      auto_reply: false
+      require_review: true
+
+# 体检报告解析配置
+report:
+  max_file_size: 10485760  # 10MB
+  allowed_formats:
+    - pdf
+  ocr_enabled: true
+  ocr_engine: paddleocr
+  storage_path: data/reports
+
+# 通知服务配置
+notification:
+  enabled: true
+  auto_remind: true
+  reminder_times:
+    - "09:00"
+    - "18:00"
+
+# 会员配置
+membership:
+  enabled: true
+  levels:
+    trial:
+      name: "体验用户"
+      features:
+        - "大群基础问答"
+      price: 0
+    member:
+      name: "会员用户"
+      features:
+        - "1v1专属群"
+        - "体检报告解析"
+        - "健康画像"
+      price: 99  # 月费

@@ -1,0 +1,67 @@
+{
+  "id": "map-mcp",
+  "name": "Map MCP",
+  "description": "Map services integration via Model Context Protocol (MCP). Supports geocoding, route planning, and POI search using AMap (GaoDe) or other MCP-compatible map servers.",
+  "version": "1.0.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "mcpServerUrl": {
+        "type": "string",
+        "description": "MCP server URL (SSE endpoint). Leave empty to use stdio transport with npx.",
+        "examples": [
+          "http://localhost:8080/sse",
+          ""
+        ]
+      },
+      "mcpCommand": {
+        "type": "string",
+        "description": "Command to start MCP server (for stdio transport).",
+        "default": "npx",
+        "examples": [
+          "npx",
+          "node"
+        ]
+      },
+      "mcpArgs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Arguments for MCP server command.",
+        "default": [
+          "@amap/mcp-server"
+        ],
+        "examples": [
+          ["@amap/mcp-server"],
+          ["node", "/path/to/mcp-server"]
+        ]
+      },
+      "apiKey": {
+        "type": "string",
+        "description": "API key for map service (if required by MCP server). Can also be set via AMAP_API_KEY environment variable.",
+        "examples": ["your-api-key-here"]
+      },
+      "timeout": {
+        "type": "number",
+        "description": "Request timeout in milliseconds.",
+        "default": 30000,
+        "minimum": 1000,
+        "maximum": 120000
+      },
+      "defaultCity": {
+        "type": "string",
+        "description": "Default city for searches.",
+        "examples": ["北京", "上海", "深圳"]
+      },
+      "searchRadius": {
+        "type": "number",
+        "description": "Default search radius in meters for nearby searches.",
+        "default": 1000,
+        "minimum": 100,
+        "maximum": 50000
+      }
+    }
+  }
+}

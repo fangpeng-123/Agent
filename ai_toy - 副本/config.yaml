@@ -1,0 +1,34 @@
+api:
+  host: "0.0.0.0"
+  port: 8000
+  debug: false
+
+model:
+  provider: "openai"
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  model_name: "qwen3-235b-a22b"
+  temperature: 0.7
+  streaming: true
+
+cache:
+  weather_ttl: 300
+  enable: true
+
+tools:
+  weather:
+    timeout: 30
+  map:
+    timeout: 30
+
+rag:
+  embedding_model: "./model/embeddings"
+  vector_store_path: "./model/vector_store"
+  top_k: 3
+
+logging:
+  level: "INFO"
+  format: "json"
+  file: "logs/agent.log"
+
+conversation:
+  max_history: 20

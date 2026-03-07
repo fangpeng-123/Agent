@@ -1,0 +1,14 @@
+# MCP服务依赖
+langchain-openai
+langchain-community
+langchain-mcp-adapters
+mcp
+python-dotenv
+aiohttp
+dashscope
+
+# 智能体依赖
+langchain-openai
+langchain-community
+python-dotenv
+langchain
