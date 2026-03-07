@@ -1,0 +1,653 @@
+# -*- coding: utf-8 -*-
+"""核心智能体模块"""
+
+import asyncio
+import sys
+import time
+from pathlib import Path
+from typing import Callable, Dict, List, Optional
+from io import BytesIO
+from asyncio import Queue
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+try:
+    from Function_Call import ALL_FUNCTIONS
+except ImportError:
+    ALL_FUNCTIONS = {}
+
+from src.core.intent import rule_based_intent_classify
+from src.core.builder import MessageBuilder
+from src.core.executor import ToolExecutor
+from src.core.requery import requery, ReQueryResult
+from src.core.tool_agent_executor import ToolAgentExecutor
+from src.utils import AgentResponse, PerformanceMetrics, ToolCall
+from src.services.tts_service import QwenTTSService, TTSConfig
+
+try:
+    import sounddevice as sd
+    import numpy as np
+
+    AUDIO_AVAILABLE = True
+except ImportError:
+    AUDIO_AVAILABLE = False
+    np = None
+    sd = None
+
+PUNCTUATION_END = frozenset("。！？")
+MAX_CHARS = 25
+
+
+def _play_audio_async(audio_data: bytes):
+    """异步播放音频（不阻塞，立即返回）"""
+    if not AUDIO_AVAILABLE or not audio_data:
+        return
+    try:
+        import wave
+        import sounddevice as sd
+
+        if audio_data[:4] == b"RIFF":
+            audio_stream = BytesIO(audio_data)
+            with wave.open(audio_stream, "rb") as wf:
+                channels = wf.getnchannels()
+                sample_width = wf.getsampwidth()
+                framerate = wf.getframerate()
+                nframes = wf.getnframes()
+                data = wf.readframes(nframes)
+        else:
+            channels = 1
+            sample_width = 2
+            framerate = 24000
+            data = np.frombuffer(audio_data, dtype=np.int16)
+
+        if sample_width == 2:
+            data = np.frombuffer(data, dtype=np.int16)
+        elif sample_width == 4:
+            data = np.frombuffer(data, dtype=np.int32)
+        else:
+            data = np.frombuffer(data, dtype=np.float32)
+        if channels == 2:
+            data = data.reshape(-1, 2)
+
+        # 异步播放：不调用 sd.wait()，让音频在后台播放
+        sd.play(data, framerate)
+        # 不等待播放完成，立即返回
+    except Exception:
+        pass
+
+
+class AudioPlayer:
+    """音频播放器 - 从队列取音频，完整播放"""
+
+    def __init__(self):
+        self.queue: Queue = Queue()
+        self.running = False
+        self._play_finished_event = asyncio.Event()
+        self._current_playing = None
+
+    async def start(self):
+        """启动播放循环"""
+        self.running = True
+        asyncio.create_task(self._play_loop())
+
+    async def stop(self):
+        """停止播放"""
+        await self.queue.put(None)
+        self.running = False
+
+    async def _play_loop(self):
+        """播放循环 - 从队列取，完整播放"""
+        while True:
+            audio_data = await self.queue.get()
+            if audio_data is None:
+                self._play_finished_event.set()
+                break
+            self._current_playing = audio_data
+            _play_audio_async(audio_data)
+            self._current_playing = None
+
+    async def put(self, audio_data: bytes):
+        """放入播放队列"""
+        await self.queue.put(audio_data)
+
+    async def wait_finish(self, timeout: float = 30.0):
+        """等待当前播放完成"""
+        try:
+            await asyncio.wait_for(self._play_finished_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+
+
+class TTSTask:
+    """TTS任务 - 双队列架构：文本队列 + 音频队列，实现LLM输出和TTS并行"""
+
+    def __init__(self, tts_service: QwenTTSService):
+        self.tts_service = tts_service
+        self.audio_player = AudioPlayer()
+
+        self._text_queue: asyncio.Queue = asyncio.Queue()
+        self._audio_queue: asyncio.Queue = asyncio.Queue()
+        self._total_audio_size = 0
+        self._total_duration = 0
+        self._first_audio_play_time: Optional[float] = None
+        self._generation_start: Optional[float] = None
+
+        self._tts_task: Optional[asyncio.Task] = None
+        self._play_task: Optional[asyncio.Task] = None
+        self._finished = False
+
+    def set_generation_start(self, start_time: float):
+        """设置生成开始时间"""
+        self._generation_start = start_time
+
+    async def start(self):
+        """启动播放器和TTS消费者"""
+        await self.audio_player.start()
+        self._tts_task = asyncio.create_task(self._tts_consumer())
+        self._play_task = asyncio.create_task(self._audio_player_task())
+
+    async def _tts_consumer(self):
+        """TTS消费者：从文本队列取文本，合成音频，放入音频队列"""
+        call_count = 0
+        while True:
+            try:
+                text_segment = await asyncio.wait_for(
+                    self._text_queue.get(), timeout=0.5
+                )
+
+                if text_segment is None:
+                    # 收到None后，检查队列是否还有文本，有则继续处理
+                    if self._text_queue.empty():
+                        print(
+                            f"[TTS] 收到None且队列为空，退出循环，当前call_count={call_count}"
+                        )
+                        break
+                    else:
+                        print(f"[TTS] 收到None但队列非空，继续处理")
+                        continue
+
+                call_count += 1
+                print(
+                    f"[TTS] synthesize调用 #{call_count}, 文本长度={len(text_segment)}, 内容='{text_segment[:20]}...'"
+                )
+
+                result = await self.tts_service.synthesize(text_segment)
+                if result.success and result.audio_data:
+                    print(f"[TTS] 合成成功，音频大小={len(result.audio_data)} bytes")
+                    await self._audio_queue.put(result.audio_data)
+                else:
+                    print(f"[TTS] 合成失败: {result.error_message}")
+
+            except asyncio.TimeoutError:
+                # 超时且_finished=True时退出
+                if self._finished and self._text_queue.empty():
+                    print(f"[TTS] 超时且队列为空，退出，call_count={call_count}")
+                    break
+                continue
+            except Exception as e:
+                print(f"[TTS Consumer Error] {e}")
+
+        print(f"[TTS] _tts_consumer结束，调用synthesize共 {call_count} 次")
+        await self._audio_queue.put(None)
+
+    async def _audio_player_task(self):
+        """音频播放任务：从音频队列取音频，播放"""
+        while True:
+            audio_data = await self._audio_queue.get()
+            if audio_data is None:
+                if self._audio_queue.empty():
+                    break
+                continue
+
+            self._total_audio_size += len(audio_data)
+            await self.audio_player.put(audio_data)
+
+            if self._first_audio_play_time is None and self._generation_start:
+                self._first_audio_play_time = (
+                    time.time() - self._generation_start
+                ) * 1000
+
+    PUNCTUATION_SET = frozenset("。！？，、；：！?")
+
+    async def add_text(self, text: str):
+        """添加文本到队列，遇到标点时触发合成"""
+        if not text:
+            return
+
+        self._text_buffer = getattr(self, "_text_buffer", "") + text
+
+        # 检查末尾是否有标点
+        if self._text_buffer and self._text_buffer[-1] in self.PUNCTUATION_SET:
+            # 末尾有标点，触发合成
+            text_to_synthesize = self._text_buffer
+            self._text_buffer = ""
+            await self._text_queue.put(text_to_synthesize)
+            print(
+                f"[TTS] 触发合成，文本长度={len(text_to_synthesize)}, 内容='{text_to_synthesize[:30]}...'"
+            )
+
+    async def finish(self):
+        """结束，等待所有音频处理完成"""
+        self._finished = True
+
+        # 1. 刷新剩余文本
+        if hasattr(self, "_text_buffer") and self._text_buffer:
+            text_to_flush = self._text_buffer
+            self._text_buffer = ""
+            await self._text_queue.put(text_to_flush)
+            print(f"[TTS] finish时flush，文本='{text_to_flush}'")
+
+        # 2. 发送结束信号
+        await self._text_queue.put(None)
+
+        # 3. 等待 TTS 合成完成
+        if self._tts_task:
+            await self._tts_task
+            print("[TTS] TTS合成任务完成")
+
+        # 4. 等待音频队列清空（关键！）
+        # 给足够时间让 _audio_player_task 把所有音频放入 audio_player.queue
+        for _ in range(10):  # 最多等待 1 秒
+            if self._audio_queue.empty():
+                break
+            await asyncio.sleep(0.1)
+
+        # 5. 等待播放队列清空
+        await self.audio_player.wait_finish(timeout=10.0)
+
+        # 6. 最后才停止
+        await self.audio_player.stop()
+        print("[TTS] 所有音频播放完成，播放器已停止")
+
+    def get_stats(self) -> tuple:
+        return self._total_audio_size, self._total_duration
+
+    def get_first_audio_time(self) -> Optional[float]:
+        """获取首段音频播放时间（毫秒）"""
+        return self._first_audio_play_time
+
+    def get_result(self):
+        from src.services.tts_service import TTSResult
+
+        return TTSResult(
+            audio_data=b"",
+            duration_ms=self._total_duration,
+            success=self._total_audio_size > 0,
+            error_message=None if self._total_audio_size > 0 else "No audio generated",
+        )
+
+
+class DecoupledAgent:
+    """
+    解耦智能体
+    架构：ReQuery -> 并行工具智能体 -> 主模型流式回复
+    """
+
+    def __init__(
+        self,
+        main_model,
+        tools: Optional[Dict[str, Callable]] = None,
+        tts_config: Optional[TTSConfig] = None,
+        use_new_architecture: bool = True,
+    ):
+        self.main_model = main_model
+        self.tool_executor = ToolExecutor(tools or ALL_FUNCTIONS)
+        self.tool_agent_executor = ToolAgentExecutor()
+        self.conversation_history: List[Dict] = []
+        self.tts_service = QwenTTSService(tts_config)
+        self.tts_enabled = self.tts_service.is_available()
+        self.use_new_architecture = use_new_architecture
+        self._profile_task: Optional[asyncio.Task] = None
+        self._profile_daemon_initialized = False
+
+    async def process(self, user_input: str, stream: bool = True) -> AgentResponse:
+        """
+        处理流程：
+        1. ReQuery 意图识别（新架构）或规则意图分类（旧架构）
+        2. 并行工具智能体执行（新架构）或工具执行（旧架构）
+        3. 主模型流式回复
+        """
+        metrics = PerformanceMetrics()
+        metrics.set_tools_loaded_time(TOOLS_LOAD_DURATION_MS)
+        metrics.set_program_start_time(PROGRAM_START)
+        metrics.record("program_start")
+        metrics.record("tools_loaded")
+
+        if self.use_new_architecture:
+            return await self._process_new(user_input, stream, metrics)
+        else:
+            return await self._process_old(user_input, stream, metrics)
+
+    async def _process_new(
+        self, user_input: str, stream: bool, metrics: PerformanceMetrics
+    ) -> AgentResponse:
+        """新架构处理流程"""
+        from src.utils import IntentType
+        from Function_Call import ALL_TOOLS
+        import json
+
+        print("\n" + "=" * 80)
+        print("[Stage 1] ========== ReQuery 意图识别 ==========")
+        metrics.record("requery_start")
+        requery_result = await requery(user_input, ALL_TOOLS)
+        metrics.record("requery_end")
+
+        print(f"[OK] 用户原始输入: {user_input}")
+        print(f"[OK] ReQuery模型重写后: {requery_result.rewritten_query}")
+        print(f"[OK] 提取参数: {json.dumps(requery_result.params, ensure_ascii=False)}")
+        requery_duration = (
+            metrics.stage_times.get("requery_end", 0)
+            - metrics.stage_times.get("requery_start", 0)
+        ) * 1000
+        print(f"[OK] ReQuery耗时: {requery_duration:.2f} ms")
+
+        print("\n" + "-" * 80)
+        print("[Stage 2] ========== 工具智能体并行判断 ==========")
+        metrics.record("tool_agents_start")
+        tool_results = await self.tool_agent_executor.execute_all(
+            requery_result.rewritten_query, requery_result.params
+        )
+        metrics.record("tool_agents_end")
+
+        active_results = [r for r in tool_results if r.get("use_tool", False)]
+        print(f"[INFO] 共评估 {len(tool_results)} 个工具智能体")
+        print(f"[INFO] 决定使用 {len(active_results)} 个工具")
+        print("-" * 40)
+        for r in tool_results:
+            use_tool = r.get("use_tool", False)
+            tool_name = r.get("tool", "unknown")
+            reason = r.get("reason", "")
+            result = r.get("result", "")
+            if use_tool:
+                print(f"  [DECISION] {tool_name}: USE_TOOL=True")
+                print(f"    原因: {reason}")
+                print(f"    结果预览: {str(result)[:200]}...")
+            else:
+                print(f"  [DECISION] {tool_name}: USE_TOOL=False")
+                print(f"    原因: {reason}")
+        tool_duration = (
+            metrics.stage_times.get("tool_agents_end", 0)
+            - metrics.stage_times.get("tool_agents_start", 0)
+        ) * 1000
+        print(f"[OK] 工具决策完成，耗时: {tool_duration:.2f} ms")
+
+        print("\n" + "-" * 80)
+        print("[Stage 3] ========== 构建 Message List ==========")
+        recent_history = (
+            self.conversation_history[-15:] if self.conversation_history else []
+        )
+        print(
+            f"[INFO] 携带 {len(recent_history)} 条历史消息 (约 {len(recent_history) // 2} 轮对话)"
+        )
+
+        messages = await MessageBuilder.build_structured_messages(
+            rewritten_query=requery_result.rewritten_query,
+            tool_results=tool_results,
+            conversation_history=self.conversation_history,
+        )
+
+        print(f"[INFO] 构建的Message List共 {len(messages)} 条消息:")
+        print("-" * 40)
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "unknown")
+            content_preview = msg.get("content", "")[:200]
+            if len(msg.get("content", "")) > 200:
+                content_preview += "..."
+            print(f"  [{i + 1}] role={role}: {content_preview}")
+        print("-" * 40)
+        print(f"[OK] Message List准备完成")
+
+        return await self._generate_response(user_input, messages, stream, metrics)
+
+    async def _process_old(
+        self, user_input: str, stream: bool, metrics: PerformanceMetrics
+    ) -> AgentResponse:
+        """旧架构处理流程（保留兼容）"""
+        import json
+
+        print("\n" + "=" * 80)
+        print("[Stage 1] 意图分类中...")
+        metrics.record("intent_classify_start")
+        intent_result = rule_based_intent_classify(user_input)
+        metrics.record("intent_classified")
+
+        print(f"[OK] 原始输入: {user_input}")
+        print(
+            f"[OK] 意图: {intent_result.intent.value}, 置信度: {intent_result.confidence:.2f}"
+        )
+        print(f"    推理: {intent_result.reasoning}")
+        if intent_result.suggested_tools:
+            print(f"    建议工具: {intent_result.suggested_tools}")
+
+        tool_calls: List[ToolCall] = []
+
+        print("\n" + "-" * 80)
+        print("[Stage 2] 工具执行...")
+
+        if intent_result.intent.value == "tool_call":
+            tools_to_call = []
+            for tool_name in intent_result.suggested_tools:
+                if tool_name in self.tool_executor.functions:
+                    tools_to_call.append(
+                        {"name": tool_name, "arguments": intent_result.extracted_params}
+                    )
+
+            if tools_to_call:
+                print(f"[INFO] 准备调用 {len(tools_to_call)} 个工具:")
+                for tc in tools_to_call:
+                    print(
+                        f"  - {tc['name']}: {json.dumps(tc['arguments'], ensure_ascii=False)}"
+                    )
+
+                tool_calls = await self.tool_executor.execute_multiple(tools_to_call)
+                metrics.record("tools_executed")
+
+                print(f"[OK] 执行了 {len(tool_calls)} 个工具:")
+                for tc in tool_calls:
+                    print(f"  ✓ {tc.tool_name}: {tc.duration_ms:.2f} ms")
+                    print(f"    结果: {str(tc.result)[:200]}...")
+            else:
+                print("[WARN] 没有可用的工具")
+        else:
+            print(f"[INFO] 意图为 {intent_result.intent.value}，不调用工具")
+
+        print("\n" + "-" * 80)
+        print("[Stage 3] 生成回复...")
+        recent_history = (
+            self.conversation_history[-15:] if self.conversation_history else []
+        )
+        print(f"[INFO] 携带 {len(recent_history)} 轮历史对话")
+
+        messages = MessageBuilder.build_main_model_messages(
+            user_input, tool_calls, self.conversation_history
+        )
+
+        print(f"[INFO] 构建的消息列表 ({len(messages)} 条消息):")
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "unknown")
+            content_preview = msg.get("content", "")[:300]
+            if len(msg.get("content", "")) > 300:
+                content_preview += "..."
+            print(f"  [{i + 1}] {role}: {content_preview}")
+
+        return await self._generate_response(user_input, messages, stream, metrics)
+
+    async def _generate_response(
+        self,
+        user_input: str,
+        messages: List[Dict],
+        stream: bool,
+        metrics: PerformanceMetrics,
+    ) -> AgentResponse:
+        """生成回复的通用逻辑"""
+        import json
+        from typing import AsyncGenerator
+
+        print("\n" + "-" * 80)
+        print("[Stage 4] 主模型生成回复...")
+        metrics.record("response_start")
+
+        tts_result = None
+
+        if stream:
+            content = ""
+            generation_start = time.time()
+            first_token_received = False
+            tts_task: Optional[TTSTask] = None
+
+            if self.tts_enabled:
+                tts_task = TTSTask(self.tts_service)
+                tts_task.set_generation_start(generation_start)
+                await tts_task.start()
+
+            print("[INFO] 开始流式接收回复:")
+            print("-" * 40)
+
+            async for chunk in self.main_model.astream(messages):
+                text = chunk.content if hasattr(chunk, "content") else str(chunk)
+                content += text
+                print(text, end="", flush=True)
+
+                if not first_token_received:
+                    first_token_time = (time.time() - generation_start) * 1000
+                    metrics.set_first_token_time(first_token_time)
+                    first_token_received = True
+
+                if tts_task:
+                    asyncio.create_task(tts_task.add_text(text))
+
+            print("\n" + "-" * 40)
+            print(f"[OK] 回复生成完成 (长度: {len(content)} 字符)")
+            if tts_task:
+                # 不等待播放完成，快速返回
+                # 音频在后台异步播放
+                await tts_task.finish()
+                tts_result = tts_task.get_result()
+        else:
+            generation_start = time.time()
+            response = await self.main_model.ainvoke(messages)
+            content = (
+                response.content if hasattr(response, "content") else str(response)
+            )
+            first_token_time = (time.time() - generation_start) * 1000
+            metrics.set_first_token_time(first_token_time)
+            print(f"[OK] 回复生成完成: {content[:200]}...")
+
+        metrics.record("response_generated")
+
+        print("\n" + "-" * 80)
+        print("[Stage 5] TTS语音合成...")
+        if tts_task:
+            audio_size, duration = tts_task.get_stats()
+            first_audio_time = tts_task.get_first_audio_time()
+            if first_audio_time is not None:
+                metrics.set_first_audio_time(first_audio_time)
+                print(
+                    f"[OK] 流式TTS完成 (首段音频: {first_audio_time:.2f}ms, 音频大小: {audio_size} bytes, 总耗时: {duration:.2f} ms)"
+                )
+            else:
+                print(
+                    f"[OK] 流式TTS完成 (音频大小: {audio_size} bytes, 总耗时: {duration:.2f} ms)"
+                )
+            metrics.set_tts_time(duration)
+        elif self.tts_enabled and content:
+            tts_start = time.time()
+            tts_result = await self.tts_service.synthesize(content)
+            tts_duration = (time.time() - tts_start) * 1000
+            metrics.set_tts_time(tts_duration)
+            if tts_result.success:
+                print(
+                    f"[OK] TTS合成成功 (耗时: {tts_duration:.2f} ms, 音频大小: {len(tts_result.audio_data)} bytes)"
+                )
+                self.tts_service.play_pcm_audio(tts_result.audio_data)
+            else:
+                print(f"[WARN] TTS合成失败: {tts_result.error_message}")
+
+        print("\n" + "-" * 80)
+        print("[Stage 6] 更新对话历史...")
+        self.conversation_history.append({"role": "user", "content": user_input})
+        self.conversation_history.append({"role": "assistant", "content": content})
+        current_history_len = len(self.conversation_history)
+        if current_history_len > 30:
+            self.conversation_history = self.conversation_history[-30:]
+            print(f"[OK] 对话历史已截断: {current_history_len} -> 30 轮")
+        else:
+            print(
+                f"[OK] 当前对话历史: {current_history_len} 条消息 (约 {current_history_len // 2} 轮对话)"
+            )
+
+        print("\n" + "-" * 80)
+        print("[Stage 7] 异步更新用户画像...")
+        asyncio.create_task(self._update_user_profile(user_input, content))
+        print("[OK] 画像更新任务已触发（非阻塞）")
+
+        metrics.record("end")
+
+        from src.utils import IntentType
+
+        print("\n" + "=" * 80)
+        print("[INFO] 本轮对话处理完成")
+        print(f"[INFO] 意图类型: {IntentType.TOOL_CALL.value}")
+        print("=" * 80 + "\n")
+
+        return AgentResponse(
+            content=content,
+            intent=IntentType.TOOL_CALL,
+            tool_calls=[],
+            metrics=metrics,
+            message_history=self.conversation_history.copy(),
+            tts_result=tts_result,
+        )
+
+    async def _update_user_profile(self, user_input: str, assistant_response: str):
+        """异步更新用户画像（使用AI模型判断）"""
+        try:
+            from Function_Call.UserProfile.profile_ai_tools import (
+                update_user_profile_ai,
+            )
+
+            result = await update_user_profile_ai(
+                user_id="user_001",
+                user_input=user_input,
+                assistant_response=assistant_response,
+            )
+            print(f"[OK] 画像更新结果: {result}")
+        except Exception as e:
+            print(f"[WARN] 更新用户画像失败: {e}")
+
+    async def init_user_profile(self):
+        """初始化用户画像（在程序启动时调用）"""
+        try:
+            from Function_Call.UserProfile.profile_daemon import get_daemon
+            from Function_Call.UserProfile.user_profile_tools import USER_PROFILES
+
+            daemon = get_daemon()
+            await daemon.start()
+            print(
+                f"[OK] 用户画像已加载，当前姓名: {USER_PROFILES.get('user_001', {}).get('name', '未填写')}"
+            )
+        except Exception as e:
+            print(f"[WARN] 初始化用户画像失败: {e}")
+
+    async def flush_user_profile(self):
+        """flush方法（保留接口兼容性）"""
+        pass
+
+
+PROGRAM_START = time.time()
+
+try:
+    TOOLS_LOAD_START = time.time()
+    from Function_Call import ALL_TOOLS
+
+    TOOLS_LOAD_END = time.time()
+    TOOLS_LOAD_DURATION_MS = (TOOLS_LOAD_END - TOOLS_LOAD_START) * 1000
+    TOOLS_LOADED_TIME = time.time()
+    print(
+        f"[OK] 成功加载 {len(ALL_TOOLS)} 个工具 (耗时: {TOOLS_LOAD_DURATION_MS:.2f} ms)"
+    )
+except ImportError as e:
+    print(f"[ERROR] 加载工具失败: {e}")
+    ALL_TOOLS = []
+    TOOLS_LOAD_DURATION_MS = 0.0
+    TOOLS_LOADED_TIME = time.time()
