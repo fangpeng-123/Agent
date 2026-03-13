@@ -159,7 +159,7 @@ async def update_user_profile_ai(
             model="qwen3-30b-a3b",
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
             api_key=SecretStr(API_KEY) if API_KEY else None,
-            temperature=0.3,
+            temperature=0.2,
             max_tokens=500,
             extra_body={"enable_thinking": False},
         )

@@ -156,7 +156,7 @@ class QwenTTSProvider(TTSProviderBase):
             tts_instance.finish()
             callback.complete_event.wait(timeout=60)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, sync_synthesize)
 
         if callback.error_msg:

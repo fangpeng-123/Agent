@@ -111,6 +111,8 @@ class StreamTTS:
 
                 if message.content_type == ContentType.AUDIO:
                     if message.audio_data:
+                        # 打印当前段的文本内容
+                        print(f"[TTS 文本段] {message.text}")
                         audio_with_fade = _apply_fade_out(message.audio_data)
                         if on_audio:
                             on_audio(audio_with_fade, message.text)
@@ -163,6 +165,8 @@ class StreamTTS:
 
                 if message.content_type == ContentType.AUDIO:
                     if message.audio_data:
+                        # 打印当前段的文本内容
+                        print(f"[TTS 文本段] {message.text}")
                         if on_audio:
                             on_audio(message.audio_data, message.text)
                         yield (message.audio_data, message.text)

@@ -43,6 +43,7 @@ from .DateTime import (
 from .weather_agents import WEATHER_AGENTS
 from .map_agents import MAP_AGENTS
 from .datetime_agents import DATETIME_AGENTS
+from .profile_agents import PROFILE_AGENTS
 
 ALL_TOOLS = (
     WEATHER_TOOLS + MAP_TOOLS + USER_PROFILE_TOOLS + DATETIME_TOOLS + PROFILE_AI_TOOLS
@@ -54,7 +55,7 @@ ALL_FUNCTIONS = {
     **DATETIME_FUNCTIONS,
     **PROFILE_AI_FUNCTIONS,
 }
-ALL_AGENTS = {**WEATHER_AGENTS, **MAP_AGENTS, **DATETIME_AGENTS}
+ALL_AGENTS = {**WEATHER_AGENTS, **MAP_AGENTS, **DATETIME_AGENTS, **PROFILE_AGENTS}
 
 __all__ = [
     "WEATHER_TOOLS",
@@ -86,5 +87,6 @@ __all__ = [
     "WEATHER_AGENTS",
     "MAP_AGENTS",
     "DATETIME_AGENTS",
+    "PROFILE_AGENTS",
     "ALL_AGENTS",
 ]

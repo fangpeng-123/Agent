@@ -39,7 +39,7 @@ MAX_CHARS = 25
 
 
 def _play_audio_async(audio_data: bytes):
-    """异步播放音频（不阻塞，立即返回）"""
+    """播放音频（等待播放完成再返回）"""
     if not AUDIO_AVAILABLE or not audio_data:
         return
     try:
@@ -69,9 +69,9 @@ def _play_audio_async(audio_data: bytes):
         if channels == 2:
             data = data.reshape(-1, 2)
 
-        # 异步播放：不调用 sd.wait()，让音频在后台播放
+        # 播放并等待完成，避免新音频中断当前音频
         sd.play(data, framerate)
-        # 不等待播放完成，立即返回
+        sd.wait()  # 等待播放完成
     except Exception:
         pass
 
@@ -96,15 +96,83 @@ class AudioPlayer:
         self.running = False
 
     async def _play_loop(self):
-        """播放循环 - 从队列取，完整播放"""
+        """播放循环 - 累积音频块后连续播放，减少停顿"""
+        print(f"=== [AudioPlayer] 播放循环启动 ===")
+        seq = 0
+        # 累积缓冲区，等待更多音频块一起播放
+        audio_buffer = []
+        buffer_size = 0
+        MAX_BUFFER_SIZE = 100 * 1024  # 累积100KB后播放
+
         while True:
-            audio_data = await self.queue.get()
+            try:
+                # 使用短超时轮询，允许累积更多音频
+                audio_data = await asyncio.wait_for(self.queue.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                # 超时后如果有累积的音频，播放它们
+                if audio_buffer:
+                    combined_audio = b"".join(audio_buffer)
+                    seq += 1
+                    print(
+                        f"[AudioPlayer #{seq}] >> 播放累积音频 {len(combined_audio) // 1024}KB (共{len(audio_buffer)}块)"
+                    )
+                    self._current_playing = combined_audio
+                    self._play_finished_event.clear()
+                    # 使用同步播放
+                    _play_audio_async(combined_audio)
+                    self._play_finished_event.set()
+                    print(f"[AudioPlayer #{seq}] >> 播放完成")
+                    self._current_playing = None
+                    audio_buffer = []
+                    buffer_size = 0
+                continue
+
             if audio_data is None:
+                # 收到结束信号，播放剩余音频
+                while not self.queue.empty():
+                    try:
+                        remaining = self.queue.get_nowait()
+                        if remaining is not None:
+                            audio_buffer.append(remaining)
+                    except asyncio.QueueEmpty:
+                        break
+
+                # 播放所有剩余音频
+                if audio_buffer:
+                    combined_audio = b"".join(audio_buffer)
+                    seq += 1
+                    print(
+                        f"[AudioPlayer #{seq}] >> 播放最后累积音频 {len(combined_audio) // 1024}KB"
+                    )
+                    self._current_playing = combined_audio
+                    self._play_finished_event.clear()
+                    _play_audio_async(combined_audio)
+                    self._play_finished_event.set()
+                    self._current_playing = None
+
+                print(f"[AudioPlayer #{seq}] >> 所有音频播放完成\n")
                 self._play_finished_event.set()
                 break
-            self._current_playing = audio_data
-            _play_audio_async(audio_data)
-            self._current_playing = None
+
+            # 累积音频块
+            audio_buffer.append(audio_data)
+            buffer_size += len(audio_data)
+
+            # 累积足够或收到结束信号时播放
+            if buffer_size >= MAX_BUFFER_SIZE:
+                combined_audio = b"".join(audio_buffer)
+                seq += 1
+                print(
+                    f"[AudioPlayer #{seq}] >> 播放累积音频 {len(combined_audio) // 1024}KB (共{len(audio_buffer)}块)"
+                )
+                self._current_playing = combined_audio
+                self._play_finished_event.clear()
+                _play_audio_async(combined_audio)
+                self._play_finished_event.set()
+                print(f"[AudioPlayer #{seq}] >> 播放完成")
+                self._current_playing = None
+                audio_buffer = []
+                buffer_size = 0
 
     async def put(self, audio_data: bytes):
         """放入播放队列"""
@@ -131,10 +199,17 @@ class TTSTask:
         self._total_duration = 0
         self._first_audio_play_time: Optional[float] = None
         self._generation_start: Optional[float] = None
+        self._first_audio_play_start_time: Optional[float] = None
 
         self._tts_task: Optional[asyncio.Task] = None
         self._play_task: Optional[asyncio.Task] = None
         self._finished = False
+
+        # 文本缓冲锁，防止并发修改导致文本丢失
+        self._text_buffer_lock = asyncio.Lock()
+
+        # 首句标志：首句快速响应，减少等待时间
+        self._is_first_segment = True
 
     def set_generation_start(self, start_time: float):
         """设置生成开始时间"""
@@ -166,17 +241,37 @@ class TTSTask:
                         print(f"[TTS] 收到None但队列非空，继续处理")
                         continue
 
-                call_count += 1
+                # 在消费者端统一分段，保证顺序
+                segments = self._split_text_segments(text_segment)
                 print(
-                    f"[TTS] synthesize调用 #{call_count}, 文本长度={len(text_segment)}, 内容='{text_segment[:20]}...'"
+                    f"\n[TTS] 收到文本长度={len(text_segment)}字，分段={len(segments)}段"
                 )
+                for i, seg in enumerate(segments):
+                    print(f"    段{i + 1}: '{seg}'")
 
-                result = await self.tts_service.synthesize(text_segment)
-                if result.success and result.audio_data:
-                    print(f"[TTS] 合成成功，音频大小={len(result.audio_data)} bytes")
-                    await self._audio_queue.put(result.audio_data)
-                else:
-                    print(f"[TTS] 合成失败: {result.error_message}")
+                # 顺序合成每个分段（保证顺序）
+                for seg_idx, text_seg in enumerate(segments):
+                    if not text_seg.strip():
+                        continue
+
+                    call_count += 1
+                    chunk_num = call_count
+                    print(
+                        f"\n=== [TTS Chunk #{chunk_num}] 合成中 (长度={len(text_seg)}) ==="
+                    )
+                    print(f"    文本内容: {text_seg}")
+
+                    result = await self.tts_service.synthesize(text_seg)
+                    if result.success and result.audio_data:
+                        print(
+                            f"[TTS Chunk #{chunk_num}] >> 合成成功 {len(result.audio_data) // 1024}KB"
+                        )
+                        self._total_duration += result.duration_ms
+                        await self._audio_queue.put(result.audio_data)
+                    else:
+                        print(
+                            f"[TTS Chunk #{chunk_num}] >> 合成失败: {result.error_message}"
+                        )
 
             except asyncio.TimeoutError:
                 # 超时且_finished=True时退出
@@ -207,35 +302,131 @@ class TTSTask:
                     time.time() - self._generation_start
                 ) * 1000
 
-    PUNCTUATION_SET = frozenset("。！？，、；：！?")
+    # 智能文本分段策略（在消费者端统一处理，保证顺序）
+    PUNCTUATION_END = frozenset("。！？")  # 句末标点 - 分割点
+    PUNCTUATION_PAUSE = frozenset("，、；：")  # 句中标点 - 可作为分割点
+
+    def _split_text_segments(self, text: str) -> list[str]:
+        """智能文本分段 - 考虑词语完整性，避免从中间切断
+
+        策略：
+        1. 按句末标点分割，确保句子完整
+        2. 句中标点可作为分割点（需要更长才分割，减少停顿）
+        3. 强制分割时避免在单词/词语中间切断
+        4. 单段最长100字符，避免TTS超时
+        """
+        if not text:
+            return []
+
+        segments = []
+        current_segment = ""
+
+        for char in text:
+            current_segment += char
+            segment_len = len(current_segment)
+
+            # 遇句末标点：立即分割
+            if char in self.PUNCTUATION_END:
+                segments.append(current_segment)
+                current_segment = ""
+            # 遇句中标点且当前段落够长（25字）：可分割
+            elif char in self.PUNCTUATION_PAUSE and segment_len >= 25:
+                segments.append(current_segment)
+                current_segment = ""
+            # 长度超限（100字）：强制分割，但要避免在词语中间切断
+            elif segment_len >= 100:
+                # 找到最后一个合适的分割点
+                split_pos = self._find_last_good_split_point(current_segment)
+                if split_pos > 0:
+                    segments.append(current_segment[:split_pos])
+                    current_segment = current_segment[split_pos:]
+                else:
+                    segments.append(current_segment)
+                    current_segment = ""
+
+        # 剩余文本
+        if current_segment:
+            segments.append(current_segment)
+
+        return segments
+
+    def _find_last_good_split_point(self, text: str) -> int:
+        """找到最后一个好的分割点，避免在词语中间切断"""
+        if not text:
+            return -1
+
+        # 先尝试找句中标点
+        for pos in range(len(text) - 1, -1, -1):
+            if text[pos] in self.PUNCTUATION_PAUSE:
+                return pos + 1
+
+        # 找最后一个完整的词语位置
+        for pos in range(len(text) - 3, max(0, len(text) - 10), -1):
+            if pos > 0 and len(text) - pos >= 3:
+                return pos
+
+        return -1
+
+    # 触发合成的阈值
+    FLUSH_MIN_LENGTH_FIRST = 8  # 首句触发阈值（8字，快速响应）
+    FLUSH_MIN_LENGTH_REST = 50  # 后续句触发阈值（50字，减少切分）
+    FLUSH_PUNCTUATIONS = ("。", "？", "！", "；")  # 句末标点
 
     async def add_text(self, text: str):
-        """添加文本到队列，遇到标点时触发合成"""
+        """添加文本到缓冲区，达到阈值或遇到句末标点时触发合成"""
         if not text:
             return
 
-        self._text_buffer = getattr(self, "_text_buffer", "") + text
+        async with self._text_buffer_lock:
+            # 累积到缓冲区
+            self._text_buffer = getattr(self, "_text_buffer", "") + text
+            buffer_len = len(self._text_buffer)
 
-        # 检查末尾是否有标点
-        if self._text_buffer and self._text_buffer[-1] in self.PUNCTUATION_SET:
-            # 末尾有标点，触发合成
-            text_to_synthesize = self._text_buffer
-            self._text_buffer = ""
-            await self._text_queue.put(text_to_synthesize)
-            print(
-                f"[TTS] 触发合成，文本长度={len(text_to_synthesize)}, 内容='{text_to_synthesize[:30]}...'"
+            # 根据是否是首句选择不同的阈值
+            is_first = self._is_first_segment
+            min_length = (
+                self.FLUSH_MIN_LENGTH_FIRST if is_first else self.FLUSH_MIN_LENGTH_REST
             )
+
+            # 检查是否需要触发合成
+            should_flush = False
+            # 遇到句末标点时触发（所有句子都响应）
+            if self._text_buffer and self._text_buffer[-1] in self.FLUSH_PUNCTUATIONS:
+                should_flush = True
+            # 累积足够长度时触发
+            elif buffer_len >= min_length:
+                should_flush = True
+
+            if should_flush:
+                # 取出当前缓冲区并放入队列
+                text_to_flush = self._text_buffer
+                self._text_buffer = ""
+                await self._text_queue.put(text_to_flush)
+
+                # 如果是首句，标记已处理完首句
+                if is_first:
+                    self._is_first_segment = False
+
+                segment_type = "首句" if is_first else "后续句"
+                print(
+                    f"\n[TTS] 触发合成({segment_type}) | 缓冲区={buffer_len}字 | 文本='{text_to_flush[:30]}...'"
+                )
+            else:
+                print(f"\n[TTS] 累积文本到缓冲区 | 缓冲区={buffer_len}字")
 
     async def finish(self):
         """结束，等待所有音频处理完成"""
         self._finished = True
 
-        # 1. 刷新剩余文本
-        if hasattr(self, "_text_buffer") and self._text_buffer:
-            text_to_flush = self._text_buffer
-            self._text_buffer = ""
-            await self._text_queue.put(text_to_flush)
-            print(f"[TTS] finish时flush，文本='{text_to_flush}'")
+        # 1. 刷新剩余文本（使用锁保护）
+        async with self._text_buffer_lock:
+            if hasattr(self, "_text_buffer") and self._text_buffer:
+                text_to_flush = self._text_buffer
+                self._text_buffer = ""
+                await self._text_queue.put(text_to_flush)
+                print(
+                    f"\n[TTS] finish时flush | 缓冲区={len(text_to_flush)}字 | 文本='{text_to_flush}'"
+                )
 
         # 2. 发送结束信号
         await self._text_queue.put(None)
@@ -518,6 +709,14 @@ class DecoupledAgent:
 
             print("\n" + "-" * 40)
             print(f"[OK] 回复生成完成 (长度: {len(content)} 字符)")
+
+            # 打印完整回复内容
+            print("\n" + "=" * 60)
+            print("【完整LLM回复内容】")
+            print("=" * 60)
+            print(content)
+            print("=" * 60 + "\n")
+
             if tts_task:
                 # 不等待播放完成，快速返回
                 # 音频在后台异步播放

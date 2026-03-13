@@ -55,6 +55,8 @@ class PerformanceMetrics:
     tools_loaded_time: Optional[float] = None
     program_start_time: Optional[float] = None
     tts_time: Optional[float] = None
+    # 记录用户提问结束时间点（用于计算对话响应总耗时）
+    user_input_end_time: Optional[float] = None
 
     def record(self, stage: str):
         self.stage_times[stage] = time.time()
@@ -74,6 +76,10 @@ class PerformanceMetrics:
     def set_tts_time(self, tts_ms: float):
         self.tts_time = tts_ms
 
+    def set_user_input_end_time(self, end_time: float):
+        """设置用户提问结束时间点"""
+        self.user_input_end_time = end_time
+
     def calculate_durations(self):
         stages = list(self.stage_times.keys())
         for i in range(len(stages) - 1):
@@ -88,22 +94,27 @@ class PerformanceMetrics:
         print("[性能监控报告]")
         print("=" * 80)
 
+        # 计算总耗时（从用户提问结束到语音回复结束）
+        if self.user_input_end_time is not None:
+            total_response_time = time.time() - self.user_input_end_time
+            print(f"  对话响应总耗时: {total_response_time:.2f} s")
+
         if include_tools_loaded and self.tools_loaded_time is not None:
-            print(f"  工具加载耗时: {self.tools_loaded_time:.2f} ms")
+            print(f"  工具加载耗时: {self.tools_loaded_time / 1000:.2f} s")
 
         for stage, duration in self.stage_durations.items():
-            print(f"  {stage}: {duration:.2f} ms")
+            print(f"  {stage}: {duration / 1000:.2f} s")
         if self.first_token_time is not None:
-            print(f"  TTFT(首token延迟): {self.first_token_time:.2f} ms")
+            print(f"  TTFT(首token延迟): {self.first_token_time / 1000:.2f} s")
         if self.first_audio_time is not None:
-            print(f"  TTFA(首段音频延迟): {self.first_audio_time:.2f} ms")
+            print(f"  TTFA(首段音频延迟): {self.first_audio_time / 1000:.2f} s")
         if self.tts_time is not None:
-            print(f"  TTS语音合成耗时: {self.tts_time:.2f} ms")
+            print(f"  TTS语音合成耗时: {self.tts_time / 1000:.2f} s")
 
         total = sum(self.stage_durations.values())
         if self.program_start_time is not None:
-            program_total = (time.time() - self.program_start_time) * 1000
-            print(f"  启动到回答完毕总耗时: {program_total:.2f} ms")
+            program_total = time.time() - self.program_start_time
+            print(f"  启动到回答完毕总耗时: {program_total:.2f} s")
         else:
-            print(f"  总耗时: {total:.2f} ms")
+            print(f"  总耗时: {total / 1000:.2f} s")
         print("=" * 80)

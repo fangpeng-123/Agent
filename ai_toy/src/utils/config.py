@@ -25,7 +25,9 @@ class IntentType(Enum):
 
 
 # 获取系统提示词类型
-SYSTEM_PROMPT_TYPE = _config.get("model", {}).get("system_prompt_type", "child_education")
+SYSTEM_PROMPT_TYPE = _config.get("model", {}).get(
+    "system_prompt_type", "child_education"
+)
 
 
 def get_system_prompt() -> str:
@@ -34,9 +36,11 @@ def get_system_prompt() -> str:
 
     if prompt_type == "child_education":
         from src.prompts.system_prompts.child_companion import CHILD_EDUCATION_PROMPT
+
         return CHILD_EDUCATION_PROMPT
     elif prompt_type == "child_companion":
         from src.prompts.system_prompts.child_companion import CHILD_EDUCATION_PROMPT
+
         return CHILD_EDUCATION_PROMPT
     elif prompt_type == "base":
         # 返回默认的基础提示词
@@ -44,6 +48,7 @@ def get_system_prompt() -> str:
     else:
         # 默认使用儿童教育提示词
         from src.prompts.system_prompts.child_companion import CHILD_EDUCATION_PROMPT
+
         return CHILD_EDUCATION_PROMPT
 
 
@@ -104,8 +109,14 @@ MAIN_MODEL_SYSTEM_PROMPT = """你是智能助手，帮助用户解答问题。
 
 可用工具：天气、地图、日期时间
 
+【重要约束 - 上下文数据使用规则】
+当需要使用天气、日期、时间、地点等信息时：
+- 优先使用上下文中提供的上下文信息
+- 如果上下文信息为空或显示"获取失败"，必须告诉用户"数据暂时不可用，请检查网络连接"
+- 绝对不能编造或猜测数据
+
 工作原则：
-1. 基于工具结果回答问题
+1. 基于工具结果或上下文信息回答问题
 2. 回答要口语化、自然，像朋友聊天一样
 3. 不要使用Markdown格式（如**粗体**、#标题、-列表、代码块等）
 4. 直接回答，简洁准确，不要加"根据查询结果"之类的开场白
@@ -122,4 +133,4 @@ MAIN_MODEL_SYSTEM_PROMPT = """你是智能助手，帮助用户解答问题。
 用户：广州后天呢？
 助手：后天广州有小雨，记得带伞，气温15到22度。
 
-工具结果已包含在上文，直接根据结果回答。"""
+工具结果和上下文信息已包含在上文，直接根据结果回答。"""

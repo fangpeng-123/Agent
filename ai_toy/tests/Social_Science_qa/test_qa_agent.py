@@ -171,7 +171,7 @@ class TestIntegration(unittest.TestCase):
 
         agent = create_agent(api_key)
         self.assertIsInstance(agent, SocialScienceQAAgent)
-        self.assertEqual(len(agent.questions), 10)
+        self.assertEqual(len(agent.questions), 50)
 
     def test_data_file_exists(self):
         """测试数据文件存在"""
@@ -190,7 +190,7 @@ class TestIntegration(unittest.TestCase):
             data = json.load(f)
 
         self.assertEqual(data["category"], "social_science")
-        self.assertEqual(len(data["questions"]), 10)
+        self.assertEqual(len(data["questions"]), 50)
 
 
 class TestEvaluationScenarios(unittest.TestCase):

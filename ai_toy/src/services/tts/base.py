@@ -55,8 +55,9 @@ class TTSProviderBase(ABC):
     ALL_PUNCTUATIONS = ("，", ",", "。", "？", "！", "；", "、", "…", "：", ":")
 
     # 动态分割阈值
-    MIN_SEGMENT_LENGTH = 8  # 逗号分割最小长度，避免过短分割
-    FAST_RESPONSE_LENGTH = 15  # 其他标点分割最小长度
+    MIN_SEGMENT_LENGTH = 8  # 短句合并阈值，低于此值不输出
+    FAST_RESPONSE_LENGTH = 15  # 其他标点分割最小长度（保留兼容性）
+    LONG_SEGMENT_LENGTH = 20  # 长句拆分阈值，超过此值进行拆分
 
     def __init__(self):
         self.tts_text_queue: queue.Queue[TTSMessage] = queue.Queue()
@@ -66,6 +67,7 @@ class TTSProviderBase(ABC):
         self.stop_event = threading.Event()
         self.processing_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._lock = threading.Lock()  # 保护 tts_text_buff 和 processed_chars
 
     def start(self):
         """启动文本处理线程"""
@@ -142,11 +144,22 @@ class TTSProviderBase(ABC):
                         filtered_text = self._filter_text(text)
                         if filtered_text:
                             self.tts_text_buff.append(filtered_text)
-                            segment_text = self._get_segment_text()
-                            if segment_text:
-                                self._loop.run_until_complete(
-                                    self._process_tts_segment(segment_text)
-                                )
+                            # 循环尝试分割，直到没有更多可分割的文本
+                            while True:
+                                segment_text = self._get_segment_text()
+                                if segment_text:
+                                    self._loop.run_until_complete(
+                                        self._process_tts_segment(segment_text)
+                                    )
+                                    # 分割完成后，检查是否还有剩余文本需要处理
+                                    # 如果 processed_chars 已经到达文本末尾，重置缓冲区
+                                    full_text = "".join(self.tts_text_buff)
+                                    if self.processed_chars >= len(full_text):
+                                        self.tts_text_buff.clear()
+                                        self.processed_chars = 0
+                                else:
+                                    # 没有更多可分割的文本，退出循环
+                                    break
         except Exception as e:
             self.tts_audio_queue.put(
                 TTSMessage(content_type=ContentType.ERROR, error=str(e))
@@ -172,12 +185,13 @@ class TTSProviderBase(ABC):
 
     def _get_segment_text(self) -> Optional[str]:
         """
-        动态文本分割
+        动态文本分割 - 新策略
 
         分割策略：
-        - 强标点（句号等）：无条件分割，保证语义完整
-        - 逗号：分割后长度 >= MIN_SEGMENT_LENGTH 才分割
-        - 其他标点：分割后长度 >= FAST_RESPONSE_LENGTH 才分割
+        1. 整句保护：如果文本已经是完整句子（含句末标点）且长度≤30字，不再切分
+        2. 长文本保护：如果输入文本 > 30字（来自上游缓冲区），直接返回
+        3. 短句合并：当前片段 < MIN_SEGMENT_LENGTH(8字) 时，继续累积
+        4. 长句拆分：当前片段 ≥ LONG_SEGMENT_LENGTH(20字) 时，在句子中间拆分
 
         Returns:
             分割出的文本段或 None
@@ -187,6 +201,19 @@ class TTSProviderBase(ABC):
 
         if not current_text:
             return None
+
+        # ========== 整句保护：如果已经是完整句子，不再二次切分 ==========
+        # 条件：文本以句末标点结尾 且 长度≤30字
+        if current_text[-1] in self.STRONG_PUNCTUATIONS:
+            if len(current_text) <= 30:
+                self.processed_chars += len(current_text)
+                return current_text
+
+        # ========== 长文本保护：来自上游缓冲区的长文本，不再切分 ==========
+        # 如果是新文本块的开始，且长度 > 30 字，直接返回
+        if self.processed_chars == 0 and len(current_text) > 30:
+            self.processed_chars += len(current_text)
+            return current_text
 
         # 找到所有标点位置
         strong_pos = self._find_first_punctuation(
@@ -209,6 +236,16 @@ class TTSProviderBase(ABC):
         if other_pos != -1:
             candidates.append((other_pos, "other"))
 
+        # 没有找到任何标点
+        if not candidates:
+            # 检查当前文本长度，超过长句阈值需要拆分
+            if len(current_text) >= self.LONG_SEGMENT_LENGTH:
+                segment = self._split_long_segment(current_text)
+                if segment:
+                    self.processed_chars += len(segment)
+                    return segment
+            return None
+
         # 按位置排序，找最近的标点
         candidates.sort(key=lambda x: x[0])
 
@@ -218,87 +255,121 @@ class TTSProviderBase(ABC):
 
             if punct_type == "strong":
                 # 强标点：无条件分割
+                # 如果太长，进行拆分
+                if segment_len >= self.LONG_SEGMENT_LENGTH:
+                    segment = self._split_long_segment(potential_segment)
+                    if segment:
+                        self.processed_chars += len(segment)
+                        return segment
                 self.processed_chars += segment_len
                 return potential_segment
+
             elif punct_type == "comma":
                 # 逗号：满足最小长度才分割
                 if segment_len >= self.MIN_SEGMENT_LENGTH:
+                    # 如果太长，进行拆分
+                    if segment_len >= self.LONG_SEGMENT_LENGTH:
+                        segment = self._split_long_segment(potential_segment)
+                        if segment:
+                            self.processed_chars += len(segment)
+                            return segment
                     self.processed_chars += segment_len
                     return potential_segment
+                # 不满足最小长度，继续累积
+
             else:
-                # 其他标点：满足快速响应长度才分割
-                if segment_len >= self.FAST_RESPONSE_LENGTH:
+                # 其他标点：满足最小长度才分割
+                if segment_len >= self.MIN_SEGMENT_LENGTH:
+                    # 如果太长，进行拆分
+                    if segment_len >= self.LONG_SEGMENT_LENGTH:
+                        segment = self._split_long_segment(potential_segment)
+                        if segment:
+                            self.processed_chars += len(segment)
+                            return segment
                     self.processed_chars += segment_len
                     return potential_segment
+                # 不满足最小长度，继续累积
 
-        return None
-
-        segment = None
-
-        # 1. 优先在强标点（句号等）处分割
-        strong_pos = self._find_first_punctuation(
-            current_text, self.STRONG_PUNCTUATIONS
-        )
-        if strong_pos != -1:
-            segment = current_text[: strong_pos + 1]
-            self.processed_chars += len(segment)
-            return segment
-
-        # 2. 检查逗号位置，满足最小长度才分割
-        comma_pos = self._find_first_punctuation(current_text, ("，", ","))
-        if comma_pos != -1:
-            potential_segment = current_text[: comma_pos + 1]
-            if len(potential_segment) >= self.MIN_SEGMENT_LENGTH:
-                segment = potential_segment
-                self.processed_chars += len(segment)
-                return segment
-
-        # 3. 检查其他标点位置，满足快速响应长度才分割
-        other_puncts = tuple(
-            p
-            for p in self.ALL_PUNCTUATIONS
-            if p not in self.STRONG_PUNCTUATIONS and p not in ("，", ",")
-        )
-        other_pos = self._find_first_punctuation(current_text, other_puncts)
-        if other_pos != -1:
-            potential_segment = current_text[: other_pos + 1]
-            if len(potential_segment) >= self.FAST_RESPONSE_LENGTH:
-                segment = potential_segment
+        # 找到了标点但不满足长度条件，或者没有更多标点
+        # 检查当前累积文本是否过长需要拆分
+        if len(current_text) >= self.LONG_SEGMENT_LENGTH:
+            segment = self._split_long_segment(current_text)
+            if segment:
                 self.processed_chars += len(segment)
                 return segment
 
         return None
 
-        # 先尝试在强标点处分割
-        strong_pos = self._find_first_punctuation(
-            current_text, self.STRONG_PUNCTUATIONS
-        )
-        medium_pos = self._find_first_punctuation(
-            current_text, self.MEDIUM_PUNCTUATIONS
-        )
-        all_pos = self._find_first_punctuation(current_text, self.ALL_PUNCTUATIONS)
+    def _split_long_segment(self, text: str) -> Optional[str]:
+        """
+        拆分长文本段
 
-        segment = None
+        在合适的位置（尽量保持语义完整）将长文本拆分为两部分：
+        - 返回前半部分用于合成
+        - 剩余部分保留在缓冲区
 
-        # 优先使用强标点（句号等），保证语义完整
-        if strong_pos != -1:
-            segment = current_text[: strong_pos + 1]
-        # 中等长度（5-15字）可以用逗号分割
-        elif medium_pos != -1:
-            potential_segment = current_text[: medium_pos + 1]
-            if len(potential_segment) >= self.MIN_SEGMENT_LENGTH:
-                segment = potential_segment
-        # 长文本（>15字）可以在任意标点分割
-        elif all_pos != -1:
-            potential_segment = current_text[: all_pos + 1]
-            if len(potential_segment) >= self.FAST_RESPONSE_LENGTH:
-                segment = potential_segment
+        Args:
+            text: 待拆分的文本
 
-        if segment:
-            self.processed_chars += len(segment)
-            return segment
+        Returns:
+            拆分后的前半部分文本
+        """
+        if len(text) < self.LONG_SEGMENT_LENGTH:
+            return text
 
-        return None
+        # 优先在以下位置拆分：
+        # 1. 逗号位置（保持语义相对完整）
+        # 2. 顿号位置
+        # 3. 空格位置（如果存在）
+        # 4. 最后一个完整句子（句号、问号、感叹号之后的位置）
+
+        # 找最后一个逗号/顿号
+        split_candidates = []
+
+        # 找逗号
+        comma_pos = text.rfind("，")
+        if comma_pos > 0:
+            split_candidates.append(comma_pos)
+
+        # 找顿号
+        dahao_pos = text.rfind("、")
+        if dahao_pos > 0:
+            split_candidates.append(dahao_pos)
+
+        # 找空格
+        space_pos = text.rfind(" ")
+        if space_pos > 0:
+            split_candidates.append(space_pos)
+
+        # 找最后一个句号/问号/感叹号（但不是最后一个字符）
+        for punct in ("。", "？", "！"):
+            pos = text.rfind(punct)
+            if pos > 0 and pos < len(text) - 1:
+                split_candidates.append(pos)
+
+        # 找中间位置作为后备
+        middle_pos = len(text) // 2
+
+        if split_candidates:
+            # 找最接近中间的位置
+            split_candidates.sort(key=lambda x: abs(x - middle_pos))
+            best_pos = split_candidates[0]
+
+            # 返回前半部分（不包含标点）
+            result = text[: best_pos + 1]
+            # 将后半部分放回缓冲区
+            remaining = text[best_pos + 1 :]
+            if remaining:
+                self.tts_text_buff = [remaining]
+            return result
+
+        # 无法找到合适的拆分点，直接从中间拆分
+        split_pos = len(text) // 2
+        result = text[:split_pos]
+        remaining = text[split_pos:]
+        if remaining:
+            self.tts_text_buff = [remaining]
+        return result
 
     def _find_first_punctuation(self, text: str, punctuations: tuple) -> int:
         """
@@ -368,6 +439,7 @@ class TTSProviderBase(ABC):
 
     def reset(self):
         """重置状态"""
-        self.tts_text_buff.clear()
-        self.processed_chars = 0
+        with self._lock:
+            self.tts_text_buff.clear()
+            self.processed_chars = 0
         self.stop_event.clear()

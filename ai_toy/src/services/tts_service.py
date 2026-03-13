@@ -99,18 +99,22 @@ class MyCallback:
     """兼容性回调类"""
 
     def __init__(self):
+        import time
+
         self.complete_event = threading.Event()
         self.audio_data = bytearray()
         self.session_id: Optional[str] = None
         self.first_audio_delay: float = 0
+        self._start_time = time.time()
+        self._first_audio_recorded = False
 
     def on_open(self) -> None:
         print("[TTS] connection opened")
 
     def on_close(self, close_status_code, close_msg) -> None:
-        print(
-            f"[TTS] connection closed with code: {close_status_code}, msg: {close_msg}"
-        )
+        # 忽略正常的空闲关闭（code 1000 或 "Bye"），只在需要时打印
+        if close_status_code and close_status_code != 1000:
+            print(f"[TTS] 连接异常关闭，code: {close_status_code}, msg: {close_msg}")
 
     def on_event(self, message: dict) -> None:
         try:
@@ -119,6 +123,10 @@ class MyCallback:
                 self.session_id = message.get("session", {}).get("id", "")
                 print(f"[TTS] session created: {self.session_id}")
             elif "response.audio.delta" == event_type:
+                # 记录首音频延迟
+                if not self._first_audio_recorded:
+                    self.first_audio_delay = (time.time() - self._start_time) * 1000
+                    self._first_audio_recorded = True
                 recv_audio_b64 = message.get("delta", "")
                 audio_data = base64.b64decode(recv_audio_b64)
                 self.audio_data.extend(audio_data)
@@ -182,7 +190,13 @@ class QwenTTSService:
             return None
         return AudioFormat.PCM_24000HZ_MONO_16BIT
 
-    async def synthesize(self, text: str) -> TTSResult:
+    async def synthesize(self, text: str, max_retries: int = 2) -> TTSResult:
+        """合成语音，支持自动重试
+
+        Args:
+            text: 要合成的文本
+            max_retries: 最大重试次数
+        """
         if not self.is_available():
             return TTSResult(
                 success=False,
@@ -190,30 +204,53 @@ class QwenTTSService:
             )
 
         start_time = time.time()
-        self._callback = MyCallback()
-
+        last_error = None
         loop = asyncio.get_event_loop()
-        try:
-            await loop.run_in_executor(None, self._run_tts_sync, text)
-        except Exception as e:
-            return TTSResult(
-                success=False,
-                error_message=f"TTS 调用失败: {str(e)}",
-                duration_ms=(time.time() - start_time) * 1000,
-            )
 
-        result = TTSResult(
-            audio_data=_apply_fade_out(bytes(self._callback.audio_data)),
+        for attempt in range(max_retries + 1):
+            try:
+                self._callback = MyCallback()
+                await loop.run_in_executor(None, self._run_tts_sync, text)
+
+                result = TTSResult(
+                    audio_data=_apply_fade_out(bytes(self._callback.audio_data)),
+                    duration_ms=(time.time() - start_time) * 1000,
+                    success=len(self._callback.audio_data) > 0,
+                    session_id=self._callback.session_id,
+                    first_audio_delay=self._callback.first_audio_delay,
+                )
+
+                if not result.success:
+                    result.error_message = "音频数据为空"
+
+                return result
+
+            except Exception as e:
+                last_error = str(e)
+                error_msg = str(e).lower()
+
+                # WebSocket关闭错误时重试
+                if (
+                    "websocket" in error_msg
+                    or "closed" in error_msg
+                    or "bye" in error_msg
+                ):
+                    print(f"[TTS] WebSocket连接断开，第 {attempt + 1} 次重试...")
+                    if attempt < max_retries:
+                        await asyncio.sleep(0.5)
+                        continue
+
+                return TTSResult(
+                    success=False,
+                    error_message=f"TTS 调用失败: {last_error}",
+                    duration_ms=(time.time() - start_time) * 1000,
+                )
+
+        return TTSResult(
+            success=False,
+            error_message=f"TTS 调用失败（已重试 {max_retries + 1} 次）: {last_error}",
             duration_ms=(time.time() - start_time) * 1000,
-            success=len(self._callback.audio_data) > 0,
-            session_id=self._callback.session_id,
-            first_audio_delay=self._callback.first_audio_delay,
         )
-
-        if not result.success:
-            result.error_message = "音频数据为空"
-
-        return result
 
     def _run_tts_sync(self, text: str):
         if QwenTtsRealtime is None:

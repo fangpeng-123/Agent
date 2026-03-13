@@ -27,6 +27,7 @@ async def example_usage():
         api_key=SecretStr(API_KEY) if API_KEY else None,
         temperature=0.7,
         streaming=True,
+        extra_body={"enable_thinking": False},
     )
 
     from src.services.tts_service import TTSConfig

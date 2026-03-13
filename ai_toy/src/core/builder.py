@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from src.utils.config import get_system_prompt, MAIN_MODEL_SYSTEM_PROMPT
 from src.utils import ToolCall
+from src.utils.context_manager import get_context_manager
 from Function_Call import get_user_profile
 from Function_Call.UserProfile import USER_PROFILES
 
@@ -21,6 +22,16 @@ async def get_user_profile_content() -> str:
             return f"[用户画像获取失败] 未找到用户 {user_id} 的画像信息"
     except Exception as e:
         return f"[用户画像获取失败] {str(e)}"
+
+
+async def get_context_info() -> str:
+    """获取上下文信息（地点、天气、日期时间）"""
+    try:
+        manager = get_context_manager("user_001")
+        return manager.get_context_info()
+    except Exception as e:
+        print(f"[WARN] 获取上下文信息失败: {e}")
+        return ""
 
 
 class MessageBuilder:
@@ -97,6 +108,11 @@ class MessageBuilder:
         user_profile = await get_user_profile_content()
         messages.append({"role": "user", "content": user_profile})
 
+        # 2.5 User message (上下文信息：地点、天气、日期时间)
+        context_info = await get_context_info()
+        if context_info:
+            messages.append({"role": "user", "content": context_info})
+
         # 3. User messages (工具调用结果)
         if tool_results:
             for r in tool_results:
@@ -114,8 +130,8 @@ class MessageBuilder:
 
         # 4. User message (用户原始输入和重写后的意图)
         original_input = (
-            conversation_history[-1]['content']
-            if conversation_history and conversation_history[-1]['role'] == 'user'
+            conversation_history[-1]["content"]
+            if conversation_history and conversation_history[-1]["role"] == "user"
             else rewritten_query
         )
         messages.append(
