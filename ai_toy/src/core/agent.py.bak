@@ -38,8 +38,27 @@ PUNCTUATION_END = frozenset("。！？")
 MAX_CHARS = 25
 
 
+def _apply_fade_out(data: np.ndarray, fade_samples: int = 480) -> np.ndarray:
+    """对音频数据应用淡出效果
+    
+    Args:
+        data: numpy 音频数据数组
+        fade_samples: 淡出采样点数，约 20ms (480@24kHz)
+    
+    Returns:
+        应用淡出后的音频数据
+    """
+    if len(data) < fade_samples * 2:
+        return data
+    
+    fade_len = min(fade_samples, len(data))
+    fade_curve = np.linspace(1.0, 0.0, fade_len)
+    data[-fade_len:] = (data[-fade_len:] * fade_curve).astype(data.dtype)
+    return data
+
+
 def _play_audio_sync(audio_data: bytes):
-    """同步播放音频（完整播放，不中断）"""
+    """同步播放音频（完整播放，不中断），末尾带淡出效果"""
     if not AUDIO_AVAILABLE or not audio_data:
         return
     try:
@@ -66,8 +85,13 @@ def _play_audio_sync(audio_data: bytes):
             data = np.frombuffer(data, dtype=np.int32)
         else:
             data = np.frombuffer(data, dtype=np.float32)
+        
         if channels == 2:
             data = data.reshape(-1, 2)
+        
+        # 应用淡出效果
+        data = _apply_fade_out(data)
+        
         sd.play(data, framerate)
         sd.wait()
         sd.stop()  # 完全停止播放器，释放资源
@@ -287,6 +311,8 @@ class DecoupledAgent:
         self.use_new_architecture = use_new_architecture
         self._profile_task: Optional[asyncio.Task] = None
         self._profile_daemon_initialized = False
+        # 保存上一个 TTS 任务，用于新请求时取消
+        self._prev_tts_task: Optional[TTSTask] = None
 
     async def process(self, user_input: str, stream: bool = True) -> AgentResponse:
         """
@@ -295,6 +321,9 @@ class DecoupledAgent:
         2. 并行工具智能体执行（新架构）或工具执行（旧架构）
         3. 主模型流式回复
         """
+        # 新请求开始时，取消之前的音频播放任务
+        await self._cancel_previous_tts_task()
+
         metrics = PerformanceMetrics()
         metrics.set_tools_loaded_time(TOOLS_LOAD_DURATION_MS)
         metrics.set_program_start_time(PROGRAM_START)
@@ -306,6 +335,36 @@ class DecoupledAgent:
         else:
             return await self._process_old(user_input, stream, metrics)
 
+    async def _cancel_previous_tts_task(self):
+        """取消之前的 TTS 任务，清空音频队列"""
+        if self._prev_tts_task is not None:
+            try:
+                prev_task = self._prev_tts_task
+                # 标记结束，让消费者停止
+                prev_task._finished = True
+                # 清空音频队列
+                while not prev_task._audio_queue.empty():
+                    try:
+                        prev_task._audio_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                # 清空播放器队列
+                while not prev_task.audio_player.queue.empty():
+                    try:
+                        prev_task.audio_player.queue.get_nowait()
+                    except Exception:
+                        break
+                # 取消之前的任务
+                if prev_task._tts_task and not prev_task._tts_task.done():
+                    prev_task._tts_task.cancel()
+                if prev_task._play_task and not prev_task._play_task.done():
+                    prev_task._play_task.cancel()
+                print("[TTS] 已取消之前的音频播放任务")
+            except Exception as e:
+                print(f"[TTS] 取消之前任务时出错: {e}")
+            finally:
+                self._prev_tts_task = None
+
     async def _process_new(
         self, user_input: str, stream: bool, metrics: PerformanceMetrics
     ) -> AgentResponse:
@@ -313,6 +372,9 @@ class DecoupledAgent:
         from src.utils import IntentType
         from Function_Call import ALL_TOOLS
         import json
+
+        # 记录用户请求开始时间（用于 TTFA 计算）
+        request_start_time = time.time()
 
         print("\n" + "=" * 80)
         print("[Stage 1] ========== ReQuery 意图识别 ==========")
@@ -385,7 +447,7 @@ class DecoupledAgent:
         print("-" * 40)
         print(f"[OK] Message List准备完成")
 
-        return await self._generate_response(user_input, messages, stream, metrics)
+        return await self._generate_response(user_input, messages, stream, metrics, request_start_time)
 
     async def _process_old(
         self, user_input: str, stream: bool, metrics: PerformanceMetrics
@@ -466,6 +528,7 @@ class DecoupledAgent:
         messages: List[Dict],
         stream: bool,
         metrics: PerformanceMetrics,
+        request_start_time: float,
     ) -> AgentResponse:
         """生成回复的通用逻辑"""
         import json
@@ -479,7 +542,9 @@ class DecoupledAgent:
 
         if stream:
             content = ""
-            generation_start = time.time()
+            # TTFA 使用用户请求开始时间，TTFT 使用 LLM 调用开始时间
+            generation_start = request_start_time  # TTFA 从用户请求开始计时
+            llm_start_time = time.time()  # TTFT 从 LLM 调用开始计时
             first_token_received = False
             tts_task: Optional[TTSTask] = None
 
@@ -487,6 +552,8 @@ class DecoupledAgent:
                 tts_task = TTSTask(self.tts_service)
                 tts_task.set_generation_start(generation_start)
                 await tts_task.start()
+                # 保存当前任务引用，用于下次请求时取消
+                self._prev_tts_task = tts_task
 
             print("[INFO] 开始流式接收回复:")
             print("-" * 40)
@@ -497,7 +564,7 @@ class DecoupledAgent:
                 print(text, end="", flush=True)
 
                 if not first_token_received:
-                    first_token_time = (time.time() - generation_start) * 1000
+                    first_token_time = (time.time() - llm_start_time) * 1000  # TTFT 只计算 LLM 延迟
                     metrics.set_first_token_time(first_token_time)
                     first_token_received = True
 
@@ -510,12 +577,13 @@ class DecoupledAgent:
                 await tts_task.finish()
                 tts_result = tts_task.get_result()
         else:
-            generation_start = time.time()
+            generation_start = request_start_time
+            llm_start_time = time.time()
             response = await self.main_model.ainvoke(messages)
             content = (
                 response.content if hasattr(response, "content") else str(response)
             )
-            first_token_time = (time.time() - generation_start) * 1000
+            first_token_time = (time.time() - llm_start_time) * 1000  # TTFT 只计算 LLM 延迟
             metrics.set_first_token_time(first_token_time)
             print(f"[OK] 回复生成完成: {content[:200]}...")
 

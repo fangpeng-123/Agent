@@ -54,10 +54,10 @@ class TTSProviderBase(ABC):
     MEDIUM_PUNCTUATIONS = ("，", ",", "。", "？", "！", "；", "…")
     ALL_PUNCTUATIONS = ("，", ",", "。", "？", "！", "；", "、", "…", "：", ":")
 
-    # 动态分割阈值
-    MIN_SEGMENT_LENGTH = 8  # 短句合并阈值，低于此值不输出
-    FAST_RESPONSE_LENGTH = 15  # 其他标点分割最小长度（保留兼容性）
-    LONG_SEGMENT_LENGTH = 20  # 长句拆分阈值，超过此值进行拆分
+    # 动态分割阈值 - 优化首段响应速度
+    MIN_SEGMENT_LENGTH = 4  # 短句合并阈值，降低以加快首段响应
+    FAST_RESPONSE_LENGTH = 8  # 其他标点分割最小长度
+    LONG_SEGMENT_LENGTH = 15  # 长句拆分阈值，降低以加快段间响应
 
     def __init__(self):
         self.tts_text_queue: queue.Queue[TTSMessage] = queue.Queue()

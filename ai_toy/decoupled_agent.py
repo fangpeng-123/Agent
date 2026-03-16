@@ -52,6 +52,9 @@ async def example_usage():
         if not user_input:
             continue
 
+        # 记录用户输入结束时间（用于计算端到端延迟）
+        user_input_end_time = time.time()
+
         if user_input.lower() in ["quit", "exit", "退出"]:
             # 退出前等待画像更新完成
             await agent.flush_user_profile()
@@ -60,7 +63,9 @@ async def example_usage():
 
         print("=" * 80)
 
-        response = await agent.process(user_input, stream=True)
+        response = await agent.process(
+            user_input, stream=True, user_input_end_time=user_input_end_time
+        )
 
         print(f"\n意图: {response.intent.value}")
 

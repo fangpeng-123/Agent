@@ -303,20 +303,24 @@ class TTSTask:
                 ) * 1000
 
     # 智能文本分段策略（在消费者端统一处理，保证顺序）
-    PUNCTUATION_END = frozenset("。！？")  # 句末标点 - 分割点
-    PUNCTUATION_PAUSE = frozenset("，、；：")  # 句中标点 - 可作为分割点
+    # 修改：减少分割点，只在长句中标点分割，减少人为停顿
+    PUNCTUATION_END = frozenset("。！？")  # 句末标点 - 仅在超长时分割
+    PUNCTUATION_PAUSE = frozenset("，、；：")  # 句中标点 - 作为分割点
 
     def _split_text_segments(self, text: str) -> list[str]:
-        """智能文本分段 - 考虑词语完整性，避免从中间切断
+        """智能文本分段 - 减少分段数量，让TTS处理自然停顿
 
         策略：
-        1. 按句末标点分割，确保句子完整
-        2. 句中标点可作为分割点（需要更长才分割，减少停顿）
-        3. 强制分割时避免在单词/词语中间切断
-        4. 单段最长100字符，避免TTS超时
+        1. 只在超长文本（60字以上）才在句中标点分割
+        2. 避免在短句（<30字）时分割，让TTS自然处理
+        3. 单段最长100字符
         """
         if not text:
             return []
+
+        # 如果文本较短（<30字），不分割，直接返回整段
+        if len(text) < 30:
+            return [text] if text.strip() else []
 
         segments = []
         current_segment = ""
@@ -325,17 +329,12 @@ class TTSTask:
             current_segment += char
             segment_len = len(current_segment)
 
-            # 遇句末标点：立即分割
-            if char in self.PUNCTUATION_END:
+            # 遇句中标点且当前段落够长（60字）：可分割
+            if char in self.PUNCTUATION_PAUSE and segment_len >= 60:
                 segments.append(current_segment)
                 current_segment = ""
-            # 遇句中标点且当前段落够长（25字）：可分割
-            elif char in self.PUNCTUATION_PAUSE and segment_len >= 25:
-                segments.append(current_segment)
-                current_segment = ""
-            # 长度超限（100字）：强制分割，但要避免在词语中间切断
+            # 长度超限（100字）：强制分割
             elif segment_len >= 100:
-                # 找到最后一个合适的分割点
                 split_pos = self._find_last_good_split_point(current_segment)
                 if split_pos > 0:
                     segments.append(current_segment[:split_pos])
@@ -369,7 +368,7 @@ class TTSTask:
 
     # 触发合成的阈值
     FLUSH_MIN_LENGTH_FIRST = 8  # 首句触发阈值（8字，快速响应）
-    FLUSH_MIN_LENGTH_REST = 50  # 后续句触发阈值（50字，减少切分）
+    FLUSH_MIN_LENGTH_REST = 60  # 后续句触发阈值（60字，减少切分）
     FLUSH_PUNCTUATIONS = ("。", "？", "！", "；")  # 句末标点
 
     async def add_text(self, text: str):
@@ -491,7 +490,12 @@ class DecoupledAgent:
         self._profile_task: Optional[asyncio.Task] = None
         self._profile_daemon_initialized = False
 
-    async def process(self, user_input: str, stream: bool = True) -> AgentResponse:
+    async def process(
+        self,
+        user_input: str,
+        stream: bool = True,
+        user_input_end_time: Optional[float] = None,
+    ) -> AgentResponse:
         """
         处理流程：
         1. ReQuery 意图识别（新架构）或规则意图分类（旧架构）
@@ -501,6 +505,8 @@ class DecoupledAgent:
         metrics = PerformanceMetrics()
         metrics.set_tools_loaded_time(TOOLS_LOAD_DURATION_MS)
         metrics.set_program_start_time(PROGRAM_START)
+        if user_input_end_time is not None:
+            metrics.set_user_input_end_time(user_input_end_time)
         metrics.record("program_start")
         metrics.record("tools_loaded")
 
@@ -741,9 +747,20 @@ class DecoupledAgent:
             first_audio_time = tts_task.get_first_audio_time()
             if first_audio_time is not None:
                 metrics.set_first_audio_time(first_audio_time)
-                print(
-                    f"[OK] 流式TTS完成 (首段音频: {first_audio_time:.2f}ms, 音频大小: {audio_size} bytes, 总耗时: {duration:.2f} ms)"
-                )
+                # 计算端到端延迟：从用户输入结束到首段音频开始播放
+                if metrics.user_input_end_time is not None:
+                    end_to_end_latency = (
+                        first_audio_time
+                        + (generation_start - metrics.user_input_end_time) * 1000
+                    )
+                    metrics.set_end_to_end_latency(end_to_end_latency)
+                    print(
+                        f"[OK] 流式TTS完成 (首段音频: {first_audio_time:.2f}ms, 端到端延迟: {end_to_end_latency:.2f}ms, 音频大小: {audio_size} bytes, 总耗时: {duration:.2f} ms)"
+                    )
+                else:
+                    print(
+                        f"[OK] 流式TTS完成 (首段音频: {first_audio_time:.2f}ms, 音频大小: {audio_size} bytes, 总耗时: {duration:.2f} ms)"
+                    )
             else:
                 print(
                     f"[OK] 流式TTS完成 (音频大小: {audio_size} bytes, 总耗时: {duration:.2f} ms)"
@@ -815,7 +832,7 @@ class DecoupledAgent:
             print(f"[WARN] 更新用户画像失败: {e}")
 
     async def init_user_profile(self):
-        """初始化用户画像（在程序启动时调用）"""
+        """初始化用户画像和上下文（在程序启动时调用）"""
         try:
             from Function_Call.UserProfile.profile_daemon import get_daemon
             from Function_Call.UserProfile.user_profile_tools import USER_PROFILES
@@ -827,6 +844,19 @@ class DecoupledAgent:
             )
         except Exception as e:
             print(f"[WARN] 初始化用户画像失败: {e}")
+
+        # 初始化上下文管理器（地点、天气、日期时间）
+        await self.init_context()
+
+    async def init_context(self):
+        """初始化上下文管理器"""
+        try:
+            from src.utils.context_manager import init_user_context
+
+            await init_user_context("user_001")
+            print("[OK] 上下文管理器已初始化 (地点、天气、日期时间)")
+        except Exception as e:
+            print(f"[WARN] 初始化上下文管理器失败: {e}")
 
     async def flush_user_profile(self):
         """flush方法（保留接口兼容性）"""

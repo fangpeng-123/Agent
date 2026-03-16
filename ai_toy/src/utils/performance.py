@@ -57,6 +57,8 @@ class PerformanceMetrics:
     tts_time: Optional[float] = None
     # 记录用户提问结束时间点（用于计算对话响应总耗时）
     user_input_end_time: Optional[float] = None
+    # 端到端延迟：从用户输入结束到首段音频开始播放
+    end_to_end_latency: Optional[float] = None
 
     def record(self, stage: str):
         self.stage_times[stage] = time.time()
@@ -79,6 +81,10 @@ class PerformanceMetrics:
     def set_user_input_end_time(self, end_time: float):
         """设置用户提问结束时间点"""
         self.user_input_end_time = end_time
+
+    def set_end_to_end_latency(self, latency_ms: float):
+        """设置端到端延迟（从用户输入结束到首段音频开始播放）"""
+        self.end_to_end_latency = latency_ms
 
     def calculate_durations(self):
         stages = list(self.stage_times.keys())
@@ -108,6 +114,10 @@ class PerformanceMetrics:
             print(f"  TTFT(首token延迟): {self.first_token_time / 1000:.2f} s")
         if self.first_audio_time is not None:
             print(f"  TTFA(首段音频延迟): {self.first_audio_time / 1000:.2f} s")
+        if self.end_to_end_latency is not None:
+            print(
+                f"  端到端延迟(输入→听到声音): {self.end_to_end_latency / 1000:.2f} s"
+            )
         if self.tts_time is not None:
             print(f"  TTS语音合成耗时: {self.tts_time / 1000:.2f} s")
 
