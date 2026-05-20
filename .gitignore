@@ -2,3 +2,5 @@
 ai_toy - 副本
 test
 **/__pycache__/
+skills/**/.test-work/
+skills/**/outputs/
